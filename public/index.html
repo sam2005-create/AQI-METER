@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <!-- viewport-fit=cover lets the app draw under the iPhone notch; safe-area padding below keeps content clear of it -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+  <!-- iOS home-screen app: fullscreen, dark translucent status bar, short name under the icon -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Live AQI">
+  <meta name="theme-color" content="#0a0a0c">
+  <meta name="format-detection" content="telephone=no">
+
+  <title>Live AQI</title>
+
+  <!-- Tailwind, prebuilt into a small static file (npm run css), so the page is styled the moment it opens -->
+  <link rel="stylesheet" href="/app.css">
+
+  <style>
+    :root { color-scheme: dark; }
+    html, body { background: #0a0a0c; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -webkit-tap-highlight-color: transparent;
+      /* keep content clear of the notch and home indicator */
+      padding-top: env(safe-area-inset-top);
+      padding-bottom: env(safe-area-inset-bottom);
+      padding-left: env(safe-area-inset-left);
+      padding-right: env(safe-area-inset-right);
+      overscroll-behavior-y: none;
+    }
+    /* glass card */
+    .glass {
+      background: rgba(255, 255, 255, 0.045);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      backdrop-filter: blur(18px) saturate(140%);
+      -webkit-backdrop-filter: blur(18px) saturate(140%);
+    }
+    /* soft colored glow behind the hero card, color set from JS */
+    .hero-glow { position: absolute; inset: -40%; filter: blur(60px); opacity: .35; transition: background .6s; pointer-events: none; }
+    .spinner {
+      width: 44px; height: 44px; border-radius: 9999px;
+      border: 3px solid rgba(255,255,255,.12); border-top-color: #fff;
+      animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .fade-in { animation: fade .35s ease-out; }
+    @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+    input::placeholder { color: rgba(255,255,255,.35); }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    /* history chart */
+    .hist-tab { padding: 2px 10px; border-radius: 9999px; color: rgba(255,255,255,.5); }
+    .hist-tab.on { background: rgba(255,255,255,.12); color: #fff; }
+    #histTip { pointer-events: none; transition: opacity .12s; }
+  </style>
+</head>
+
+<body class="text-white min-h-screen">
+  <main class="max-w-md mx-auto px-4 pb-8">
+
+    <!-- ===== Header ===== -->
+    <header class="flex items-center justify-between pt-4 pb-3">
+      <div>
+        <h1 class="text-2xl font-semibold tracking-tight">Live AQI</h1>
+        <p class="text-xs text-white/40">WAQI ground stations + Open-Meteo estimates</p>
+      </div>
+      <div class="flex gap-2">
+        <button id="btnRefresh" class="glass w-10 h-10 rounded-full grid place-items-center active:scale-95 transition" aria-label="Refresh">
+          <svg class="w-5 h-5" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h5M20 20v-5h-5M5.1 15a7 7 0 0 0 12.4 2M18.9 9A7 7 0 0 0 6.5 7"/></svg>
+        </button>
+      </div>
+    </header>
+
+    <!-- ===== Search ===== -->
+    <form id="searchForm" class="relative" autocomplete="off">
+      <div class="glass rounded-2xl flex items-center px-3">
+        <svg class="w-5 h-5 text-white/40 shrink-0" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path stroke-linecap="round" d="m20 20-3.5-3.5"/></svg>
+        <input id="searchInput" type="search" enterkeyhint="search" placeholder="Search any city or place: Tokyo, London..."
+               class="bg-transparent w-full px-2 py-3 text-[16px] outline-none" />
+      </div>
+      <!-- search results dropdown -->
+      <ul id="results" class="hidden absolute z-20 left-0 right-0 mt-2 rounded-2xl overflow-hidden bg-[#16161a]/95 border border-white/10 backdrop-blur-xl max-h-80 overflow-y-auto"></ul>
+    </form>
+
+    <!-- ===== Quick-select chips ===== -->
+    <div class="flex gap-2 mt-3 overflow-x-auto no-scrollbar">
+      <button data-chip="gps" class="chip glass shrink-0 rounded-full px-4 py-2 text-sm flex items-center gap-1.5 active:scale-95 transition">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path stroke-linecap="round" d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+        Current GPS
+      </button>
+      <button data-chip="bhubaneswar" class="chip glass shrink-0 rounded-full px-4 py-2 text-sm active:scale-95 transition">Bhubaneswar</button>
+      <button data-chip="delhi" class="chip glass shrink-0 rounded-full px-4 py-2 text-sm active:scale-95 transition">Delhi / NCR</button>
+    </div>
+
+    <!-- ===== Error / notice banner ===== -->
+    <div id="notice" class="hidden mt-4 rounded-2xl px-4 py-3 text-sm border fade-in"></div>
+
+    <!-- ===== AQI hero card ===== -->
+    <section id="hero" class="hidden relative overflow-hidden glass rounded-3xl p-6 mt-4 fade-in">
+      <div id="heroGlow" class="hero-glow"></div>
+      <div class="relative">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0">
+            <p class="text-xs uppercase tracking-wider text-white/40" id="sourceLabel">Nearest station</p>
+            <h2 id="stationName" class="text-lg font-medium leading-snug mt-0.5 break-words"></h2>
+          </div>
+          <span class="shrink-0 mt-1 flex items-center gap-1.5 text-xs text-white/50">
+            <span id="liveDotColor" class="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span><span id="liveText">Live</span>
+          </span>
+        </div>
+
+        <!-- which source is shown (measured station vs model estimate) and why -->
+        <div class="mt-3">
+          <span id="sourceBadge" class="inline-block text-[11px] font-medium rounded-full px-2.5 py-1"></span>
+          <p id="sourceReason" class="text-xs text-white/50 mt-1.5 leading-snug"></p>
+          <button id="otherSource" class="hidden mt-2 text-xs text-sky-300 underline underline-offset-2 text-left"></button>
+        </div>
+
+        <div class="flex items-end gap-4 mt-5">
+          <span id="aqiValue" class="text-[88px] leading-none font-bold tracking-tighter tabular-nums">--</span>
+          <div class="pb-3">
+            <p class="text-xs text-white/40">US AQI</p>
+            <p id="aqiLabel" class="text-lg font-semibold leading-tight"></p>
+          </div>
+        </div>
+
+        <!-- 0-500 scale bar with a marker for the current value -->
+        <div class="mt-5">
+          <div class="relative h-2 rounded-full" style="background:linear-gradient(90deg,#00e400 0%,#00e400 10%,#ffff00 10%,#ffff00 20%,#ff7e00 20%,#ff7e00 30%,#ff0000 30%,#ff0000 40%,#8f3f97 40%,#8f3f97 60%,#7e0023 60%,#7e0023 100%)">
+            <div id="aqiMarker" class="absolute -top-1 w-4 h-4 rounded-full bg-white border-2 border-black transition-all duration-700" style="left:0%"></div>
+          </div>
+          <!-- labels sit at the same % as the colour breaks above -->
+          <div class="relative h-4 text-[10px] text-white/30 mt-1.5">
+            <span class="absolute" style="left:0">0</span>
+            <span class="absolute -translate-x-1/2" style="left:10%">50</span>
+            <span class="absolute -translate-x-1/2" style="left:20%">100</span>
+            <span class="absolute -translate-x-1/2" style="left:30%">150</span>
+            <span class="absolute -translate-x-1/2" style="left:40%">200</span>
+            <span class="absolute -translate-x-1/2" style="left:60%">300</span>
+            <span class="absolute right-0">500</span>
+          </div>
+        </div>
+
+        <p id="aqiAdvice" class="text-sm text-white/70 mt-4"></p>
+
+        <div class="flex flex-wrap gap-x-4 gap-y-1 mt-4 text-xs text-white/45">
+          <span>Main pollutant: <b id="dominant" class="text-white/80 font-medium"></b></span>
+          <span id="updated"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===== Pollutant breakdown ===== -->
+    <section id="pollutants" class="hidden mt-4 fade-in">
+      <div class="flex items-baseline justify-between px-1 mb-2">
+        <h3 class="text-sm font-medium text-white/70">Pollutants</h3>
+        <span class="text-[11px] text-white/35">AQI sub-index per pollutant</span>
+      </div>
+      <div id="pollutantGrid" class="grid grid-cols-3 gap-2"></div>
+    </section>
+
+    <!-- ===== Weather at the station (if reported) ===== -->
+    <section id="weather" class="hidden glass rounded-2xl mt-4 px-4 py-3 grid grid-cols-3 text-center fade-in"></section>
+
+    <!-- ===== PM2.5 forecast (if the station has one) ===== -->
+    <section id="forecast" class="hidden mt-4 fade-in">
+      <h3 class="text-sm font-medium text-white/70 px-1 mb-2">PM2.5 forecast</h3>
+      <div id="forecastRow" class="grid grid-cols-4 gap-2"></div>
+    </section>
+
+    <!-- ===== AQI history (hourly, from the backend's database) ===== -->
+    <section id="history" class="hidden glass rounded-2xl mt-4 p-4 fade-in">
+      <div class="flex items-center justify-between">
+        <h3 class="text-sm font-medium text-white/70">AQI history</h3>
+        <div class="flex text-[11px] font-medium bg-white/5 rounded-full p-0.5">
+          <button class="hist-tab on" data-days="7">7 days</button>
+          <button class="hist-tab" data-days="30">30 days</button>
+        </div>
+      </div>
+      <p id="histSummary" class="text-[12px] text-white/60 mt-2 tabular-nums">Loading...</p>
+      <div id="histChart" class="relative mt-3 select-none" style="height:180px; touch-action: pan-y;">
+        <div id="histTip" class="absolute top-0 z-10 opacity-0 rounded-lg bg-black/85 border border-white/10 px-2 py-1 text-[11px] leading-snug whitespace-nowrap"></div>
+      </div>
+      <p id="histNote" class="text-[10px] text-white/35 mt-2 leading-relaxed"></p>
+    </section>
+
+    <!-- ===== Footer / attribution (WAQI asks apps to credit the data source) ===== -->
+    <footer class="mt-6 text-[11px] text-white/30 leading-relaxed px-1">
+      <p>Data: <span id="credit">World Air Quality Index Project (waqi.info)</span>.</p>
+      <p class="mt-1">Values use the US EPA AQI scale. India's CPCB AQI uses different breakpoints, so numbers on Indian government sites can differ.</p>
+    </footer>
+  </main>
+
+  <!-- ===== Loading overlay ===== -->
+  <div id="loader" class="hidden fixed inset-0 z-50 grid place-items-center bg-black/50 backdrop-blur-sm">
+    <div class="flex flex-col items-center gap-3">
+      <div class="spinner"></div>
+      <p id="loaderText" class="text-sm text-white/60">Fetching air quality...</p>
+    </div>
+  </div>
+
+<script>
+/* =========================================================================
+   CONFIG
+   All data comes from this app's own backend (src/worker.js) under /api.
+   The WAQI token is a server secret, so nothing sensitive is in this page.
+   ========================================================================= */
+const AUTO_REFRESH_MS = 10 * 60 * 1000;   // refresh every 10 minutes while open
+const STORE_LAST = 'aqi.last';           // last place viewed, used if GPS fails
+
+/* ---------- small helpers ---------- */
+const $ = (id) => document.getElementById(id);
+
+// localStorage can throw in private mode, so every access is wrapped
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+
+// AQI category: label, colors and health advice (US EPA breakpoints)
+function category(aqi) {
+  const n = Number(aqi);
+  if (!Number.isFinite(n)) return { label: 'No data', color: '#6b7280', text: '#fff', advice: 'This station is not reporting right now.' };
+  if (n <= 50)  return { label: 'Good', color: '#00e400', text: '#000', advice: 'Air is clean. A good time to be outside.' };
+  if (n <= 100) return { label: 'Moderate', color: '#ffff00', text: '#000', advice: 'Fine for most people. If you are very sensitive, cut down on long or heavy exercise outdoors.' };
+  if (n <= 150) return { label: 'Unhealthy for sensitive groups', color: '#ff7e00', text: '#000', advice: 'Children, older adults and people with asthma or heart disease should limit long outdoor activity.' };
+  if (n <= 200) return { label: 'Unhealthy', color: '#ff0000', text: '#fff', advice: 'Everyone may feel effects. Limit time outdoors and consider an N95 mask.' };
+  // "ink" is a lighter shade for big numbers, since standard purple/maroon are hard to read on black
+  if (n <= 300) return { label: 'Very unhealthy', color: '#8f3f97', ink: '#c77dd1', text: '#fff', advice: 'Health alert. Avoid outdoor exercise, keep windows shut, run an air purifier if you have one.' };
+  return { label: 'Hazardous', color: '#7e0023', ink: '#e0406f', text: '#fff', advice: 'Emergency conditions. Stay indoors and avoid all outdoor activity.' };
+}
+
+const POLLUTANTS = [
+  { key: 'pm25', name: 'PM2.5' },
+  { key: 'pm10', name: 'PM10' },
+  { key: 'o3',   name: 'O₃' },
+  { key: 'no2',  name: 'NO₂' },
+  { key: 'so2',  name: 'SO₂' },
+  { key: 'co',   name: 'CO' },
+];
+const POLLUTANT_NAME = Object.fromEntries(POLLUTANTS.map(p => [p.key, p.name]));
+
+/* ---------- UI state helpers ---------- */
+function showLoader(text = 'Fetching air quality...') { $('loaderText').textContent = text; $('loader').classList.remove('hidden'); }
+function hideLoader() { $('loader').classList.add('hidden'); }
+
+function notice(msg, kind = 'error') {
+  const el = $('notice');
+  if (!msg) { el.classList.add('hidden'); return; }
+  el.className = 'mt-4 rounded-2xl px-4 py-3 text-sm border fade-in ' +
+    (kind === 'error' ? 'bg-red-500/10 border-red-500/30 text-red-200' : 'bg-amber-400/10 border-amber-400/30 text-amber-100');
+  el.textContent = msg;
+}
+
+function setActiveChip(name) {
+  document.querySelectorAll('.chip').forEach(c => {
+    const on = c.dataset.chip === name;
+    c.classList.toggle('bg-white', on);
+    c.classList.toggle('text-black', on);
+    c.classList.toggle('glass', !on);
+  });
+}
+
+/* ---------- backend API ---------- */
+async function api(path) {
+  let res;
+  try { res = await fetch(`/api/${path}`); }
+  catch { throw new Error('No internet connection, or the server is unreachable.'); }
+  let body = null;
+  try { body = await res.json(); } catch {}
+  if (!res.ok) throw new Error(body?.error || `Server error (${res.status}).`);
+  return body;
+}
+
+/* ---------- loaders ---------- */
+let lastLoad = null;      // what to reload on refresh
+let lastFetchAt = 0;
+
+async function run(task, loaderText) {
+  notice(null);
+  showLoader(loaderText);
+  try {
+    await task();
+    lastFetchAt = Date.now();
+  } catch (err) {
+    notice(err.message || 'Something went wrong.');
+  } finally {
+    hideLoader();
+  }
+}
+
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!('geolocation' in navigator)) return reject(new Error('This browser has no location support.'));
+    navigator.geolocation.getCurrentPosition(resolve, (e) => {
+      const why = e.code !== 1
+        ? 'Could not get your location right now.'
+        : isStandalone()
+          ? 'iPhone blocked location for the home-screen app (it has its own permission, separate from Safari). Fix: Settings > Privacy & Security > Location Services > Safari Websites > While Using the App. If that is already set, delete this icon, add it again from Safari, open it and tap Current GPS, then Allow.'
+          : 'Location permission is off. On iPhone: Settings > Privacy & Security > Location Services > Safari Websites > While Using the App, then tap Current GPS again.';
+      reject(new Error(why));
+    }, { enableHighAccuracy: false, timeout: 12000, maximumAge: 5 * 60 * 1000 });
+  });
+}
+
+/* ---------- saved spot for the home-screen icon ----------
+   When GPS works in Safari, the rounded spot is written into the page link
+   after the # sign. "Add to Home Screen" keeps that link, so the icon knows
+   the spot even when iOS refuses live location inside the home-screen app.
+   The part after # never leaves the phone (it isn't sent to the server). */
+function savedHome() {
+  const m = location.hash.match(/home=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+  return m ? { lat: Number(m[1]), lon: Number(m[2]) } : null;
+}
+
+function saveHomeInLink(lat, lon) {
+  if (isStandalone()) return;
+  const had = savedHome();
+  if (had && had.lat === lat && had.lon === lon) return;      // already saved, no need to nag
+  try { history.replaceState(null, '', `${location.pathname}${location.search}#home=${lat},${lon}`); } catch {}
+  if ($('notice').classList.contains('hidden')) {
+    notice('Location found. To use it from your Home Screen, tap Share > Add to Home Screen now, from this page. The icon will remember this spot.', 'warn');
+  }
+}
+
+/* ---------- rough location from the internet connection ----------
+   City-level only (mobile networks can be off by a city), no permission
+   needed. Used only when live GPS is blocked, to notice that you have
+   travelled far from the saved spot. */
+const IP_TRAVEL_KM = 100;
+
+async function ipLocation() {
+  try {
+    const r = await api('whereami');
+    return Number.isFinite(r.lat) && Number.isFinite(r.lon) ? r : null;
+  } catch { return null; }
+}
+
+// When live GPS is blocked: saved spot, unless the internet connection says
+// you are far away from it (travelling), then that city instead.
+// Returns true if something was shown.
+async function showFallback() {
+  const home = savedHome();
+  const ip = await ipLocation();
+  const far = ip && home && kmBetween(home.lat, home.lon, ip.lat, ip.lon) > IP_TRAVEL_KM;
+  if (ip && (far || !home)) {
+    const city = ip.city || 'your area';
+    await feedNear(ip.lat, ip.lon, city);
+    notice(far
+      ? `Live GPS is blocked and your internet connection puts you in ${city}, far from your saved spot, so this shows ${city}. It's city-level, so for an exact reading open the link in Safari.`
+      : `Live GPS is blocked, so this is your rough area (${city}) from your internet connection.`, 'warn');
+    return true;
+  }
+  if (home) {
+    await feedNear(home.lat, home.lon, 'your saved spot');
+    notice('iPhone did not give live location to the home-screen app, so this is the spot saved when you added the icon. Air quality is the same across about 1 km.', 'warn');
+    return true;
+  }
+  return false;
+}
+
+// Great-circle distance in km (Haversine), used for the travel check
+function kmBetween(lat1, lon1, lat2, lon2) {
+  const r = (x) => x * Math.PI / 180;
+  const a = Math.sin(r(lat2 - lat1) / 2) ** 2 + Math.cos(r(lat1)) * Math.cos(r(lat2)) * Math.sin(r(lon2 - lon1) / 2) ** 2;
+  return 2 * 6371 * Math.asin(Math.sqrt(a));
+}
+
+const distText = (km) => km < 1 ? 'under 1 km away' : `${Math.round(km)} km away`;
+
+// Ask the backend for the best reading at a point, then show it and say
+// which source won and why. The rule itself lives in src/worker.js.
+async function feedNear(lat, lon, placeLabel) {
+  const display = placeLabel === 'you' ? 'Your location' : placeLabel.charAt(0).toUpperCase() + placeLabel.slice(1);
+  const r = await api(`aqi?lat=${lat}&lon=${lon}`);
+  loadHistory(lat, lon);          // runs in the background; the hero card doesn't wait for it
+  const near = r.nearest;
+  const maxKm = r.rule?.maxKm ?? 25;
+  let station = r.station;
+  const model = r.model ? { ...r.model, city: { ...r.model.city, name: display } } : null;
+
+  const showModel = (why) => render(model, `Estimate for ${display}`, {
+    kind: 'model', reason: why,
+    other: near ? { text: `See nearest WAQI station instead (AQI ${near.aqi}, ${distText(near.km)})`, action: () => run(showStation) } : null,
+  });
+
+  async function showStation() {
+    station ||= await api(`station?uid=${near.uid}`);
+    render(station, `Nearest station to ${placeLabel} \u00b7 ${distText(near.km)}`, {
+      kind: 'waqi',
+      reason: near.km <= maxKm
+        ? 'Measured by a ground station near you, the most accurate source here.'
+        : `Measured, but ${distText(near.km)}, so it may not match conditions where you are.`,
+      other: model ? { text: `See Open-Meteo estimate for the exact spot (AQI ${model.aqi})`, action: () => showModel('Model estimate for the exact spot, shown on request.') } : null,
+    });
+  }
+
+  if (r.chosen === 'waqi') return showStation();
+  if (r.reason === 'station_stale') {
+    return showModel(`The WAQI station ${distText(near.km)} last reported ${Math.round(r.stationAgeH)} h ago, so this is a model estimate for the exact spot.`);
+  }
+  return showModel(near
+    ? `No WAQI station within ${maxKm} km (the nearest live one is ${Math.round(near.km)} km away), so this is a model estimate for the exact spot.`
+    : 'No WAQI station found nearby, so this is a model estimate for the exact spot.');
+}
+
+async function loadGPS() {
+  setActiveChip('gps');
+  lastLoad = loadGPS;
+  await run(async () => {
+    let pos;
+    try {
+      pos = await getPosition();
+    } catch (e) {
+      // iOS often blocks location for home-screen web apps even when Safari has it.
+      if (await showFallback()) return;
+      throw e;
+    }
+    // privacy: round to 2 decimals (about 1 km) before anything leaves the phone.
+    // Air quality doesn't change at that scale, so accuracy is unaffected.
+    const lat = Math.round(pos.coords.latitude * 100) / 100;
+    const lon = Math.round(pos.coords.longitude * 100) / 100;
+    await feedNear(lat, lon, 'you');
+    store.set(STORE_LAST, JSON.stringify({ type: 'gps' }));
+    saveHomeInLink(lat, lon);
+  }, 'Finding your location...');
+}
+
+// For chips that are a fixed point on the map (e.g. Bhubaneswar, which has no WAQI station of its own)
+async function loadCoords(lat, lon, label, chip) {
+  setActiveChip(chip);
+  lastLoad = () => loadCoords(lat, lon, label, chip);
+  await run(async () => {
+    await feedNear(lat, lon, label);
+    store.set(STORE_LAST, JSON.stringify({ type: 'coords', lat, lon, label, chip }));
+  });
+}
+
+async function loadStation(uid, chip = null) {
+  setActiveChip(chip);
+  lastLoad = () => loadStation(uid, chip);
+  await run(async () => {
+    const data = await api(`station?uid=${encodeURIComponent(uid)}`);
+    hideHistory();
+    render(data, 'Selected station', { kind: 'waqi', reason: 'Measured by the WAQI station you picked.' });
+    store.set(STORE_LAST, JSON.stringify({ type: 'uid', uid, chip }));
+  });
+}
+
+// Used by the city chips: search the name, then open the best station
+async function loadPlace(keyword, chip) {
+  setActiveChip(chip);
+  lastLoad = () => loadPlace(keyword, chip);
+  await run(async () => {
+    const data = await api(`place?q=${encodeURIComponent(keyword)}`);
+    hideHistory();
+    render(data, `Best live station for ${keyword}`, { kind: 'waqi', reason: 'Measured by the most recently reporting WAQI station for this city.' });
+    store.set(STORE_LAST, JSON.stringify({ type: 'place', keyword, chip }));
+  });
+}
+
+/* ---------- search bar ---------- */
+let searchTimer = null;
+let searchSeq = 0;      // ignore responses from older keystrokes
+
+async function doSearch(q) {
+  const ul = $('results');
+  q = q.trim();
+  if (q.length < 2) { ul.classList.add('hidden'); return; }
+  const seq = ++searchSeq;
+  ul.innerHTML = '';
+  ul.appendChild(resultRow('Searching...', null, true));
+  ul.classList.remove('hidden');
+  try {
+    const list = await api(`search?q=${encodeURIComponent(q)}`);
+    if (seq !== searchSeq) return;
+    ul.innerHTML = '';
+    if (!list.length) { ul.appendChild(resultRow(`No stations found for "${q}"`, null, true)); return; }
+    // live stations first, then the ones that are offline
+    list.sort((a, b) => Number.isFinite(Number(b.aqi)) - Number.isFinite(Number(a.aqi)));
+    list.slice(0, 15).forEach(s => ul.appendChild(resultRow(s.station?.name || 'Unknown station', s)));
+  } catch (err) {
+    if (seq !== searchSeq) return;
+    ul.innerHTML = '';
+    ul.appendChild(resultRow(err.message, null, true));
+  }
+}
+
+// One row in the results list. Built with textContent so station names can't inject HTML.
+function resultRow(text, station, muted = false) {
+  const li = document.createElement('li');
+  li.className = 'flex items-center justify-between gap-3 px-4 py-3 border-b border-white/5 last:border-0 ' +
+    (muted ? 'text-white/40 text-sm' : 'active:bg-white/10 cursor-pointer');
+  const name = document.createElement('span');
+  name.className = 'text-sm leading-snug';
+  name.textContent = text;
+  li.appendChild(name);
+  if (station) {
+    const c = category(station.aqi);
+    const badge = document.createElement('span');
+    badge.className = 'shrink-0 text-xs font-semibold rounded-lg px-2 py-1 tabular-nums';
+    badge.style.background = c.color;
+    badge.style.color = c.text;
+    badge.textContent = Number.isFinite(Number(station.aqi)) ? station.aqi : 'off';
+    li.appendChild(badge);
+    li.addEventListener('click', () => {
+      $('results').classList.add('hidden');
+      $('searchInput').value = '';
+      $('searchInput').blur();
+      loadStation(station.uid, null);
+    });
+  }
+  return li;
+}
+
+/* ---------- rendering ---------- */
+// meta.kind: 'waqi' (measured) or 'model' (Open-Meteo estimate)
+// meta.reason: one line on why this source was picked
+// meta.other: { text, action } link to view the other source
+function render(d, sourceLabel, meta = { kind: 'waqi' }) {
+  const c = category(d.aqi);
+  const n = Number(d.aqi);
+  const isModel = meta.kind === 'model';
+
+  $('sourceLabel').textContent = sourceLabel;
+  const badge = $('sourceBadge');
+  badge.textContent = isModel ? 'Estimate · Open-Meteo model' : 'Measured · WAQI ground station';
+  badge.className = 'inline-block text-[11px] font-medium rounded-full px-2.5 py-1 ' +
+    (isModel ? 'bg-amber-400/15 text-amber-200' : 'bg-emerald-400/15 text-emerald-200');
+  $('sourceReason').textContent = meta.reason || '';
+  const other = $('otherSource');
+  if (meta.other) {
+    other.textContent = meta.other.text;
+    other.onclick = meta.other.action;
+    other.classList.remove('hidden');
+  } else other.classList.add('hidden');
+  $('liveText').textContent = isModel ? 'Model' : 'Live';
+  $('liveDotColor').className = 'w-2 h-2 rounded-full animate-pulse ' + (isModel ? 'bg-amber-300' : 'bg-emerald-400');
+  $('stationName').textContent = d.city?.name || 'Unknown station';
+  $('aqiValue').textContent = Number.isFinite(n) ? n : '--';
+  $('aqiValue').style.color = c.ink || c.color;
+  $('aqiLabel').textContent = c.label;
+  $('aqiAdvice').textContent = c.advice;
+  $('heroGlow').style.background = `radial-gradient(circle at 30% 30%, ${c.color}, transparent 60%)`;
+  // the scale bar is drawn so 0-200 fills 40%, 200-300 the next 20%, 300-500 the rest
+  const pct = !Number.isFinite(n) ? 0 : n <= 200 ? n / 200 * 40 : n <= 300 ? 40 + (n - 200) / 100 * 20 : Math.min(100, 60 + (n - 300) / 200 * 40);
+  $('aqiMarker').style.left = `calc(${pct}% - 8px)`;
+  $('dominant').textContent = POLLUTANT_NAME[d.dominentpol] || (d.dominentpol || 'n/a').toUpperCase();
+
+  // timestamp: station reading time + how old it is
+  const t = d.time?.iso ? new Date(d.time.iso) : null;
+  if (t && !isNaN(t)) {
+    const mins = Math.round((Date.now() - t.getTime()) / 60000);
+    const ago = mins < 1 ? 'just now' : mins < 60 ? `${mins} min ago` : mins < 48 * 60 ? `${Math.round(mins / 60)} h ago` : `${Math.round(mins / 1440)} days ago`;
+    const when = t.toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
+    $('updated').textContent = `Updated ${when} (${ago})`;
+    if (mins > 3 * 60) notice(`This station's last reading is ${ago}. Try another nearby station from search.`, 'warn');
+  } else {
+    $('updated').textContent = '';
+  }
+
+  // pollutant cards
+  const grid = $('pollutantGrid');
+  grid.innerHTML = '';
+  POLLUTANTS.forEach(p => {
+    const v = d.iaqi?.[p.key]?.v;
+    const has = Number.isFinite(Number(v));
+    const pc = category(v);
+    const card = document.createElement('div');
+    card.className = 'glass rounded-2xl p-3';
+    const top = document.createElement('div');
+    top.className = 'flex items-center justify-between';
+    const label = document.createElement('span');
+    label.className = 'text-xs text-white/50';
+    label.textContent = p.name;
+    const dot = document.createElement('span');
+    dot.className = 'w-2 h-2 rounded-full';
+    dot.style.background = has ? pc.color : 'rgba(255,255,255,.15)';
+    top.append(label, dot);
+    const val = document.createElement('p');
+    val.className = 'text-2xl font-semibold mt-1 tabular-nums';
+    val.textContent = has ? Math.round(v) : '—';
+    if (!has) val.classList.add('text-white/25');
+    const bar = document.createElement('div');
+    bar.className = 'h-1 rounded-full bg-white/10 mt-2 overflow-hidden';
+    const fill = document.createElement('div');
+    fill.className = 'h-full rounded-full transition-all duration-700';
+    fill.style.width = has ? `${Math.min(100, v / 300 * 100)}%` : '0%';
+    fill.style.background = pc.color;
+    bar.appendChild(fill);
+    card.append(top, val, bar);
+    grid.appendChild(card);
+  });
+
+  // weather row (temperature, humidity, wind) when the station reports it
+  const w = $('weather');
+  const items = [
+    ['Temp', d.iaqi?.t?.v, '°C'],
+    ['Humidity', d.iaqi?.h?.v, '%'],
+    ['Wind', d.iaqi?.w?.v, ' m/s'],
+  ].filter(([, v]) => Number.isFinite(Number(v)));
+  w.innerHTML = '';
+  if (items.length) {
+    w.style.gridTemplateColumns = `repeat(${items.length}, minmax(0, 1fr))`;
+    items.forEach(([k, v, unit]) => {
+      const cell = document.createElement('div');
+      const a = document.createElement('p'); a.className = 'text-[11px] text-white/40'; a.textContent = k;
+      const b = document.createElement('p'); b.className = 'text-base font-medium tabular-nums'; b.textContent = `${Math.round(v)}${unit}`;
+      cell.append(a, b);
+      w.appendChild(cell);
+    });
+    w.classList.remove('hidden');
+  } else w.classList.add('hidden');
+
+  // PM2.5 forecast: today and the next few days
+  const fc = (d.forecast?.daily?.pm25 || []);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const upcoming = fc.filter(x => new Date(x.day + 'T00:00:00') >= today).slice(0, 4);
+  const row = $('forecastRow');
+  row.innerHTML = '';
+  if (upcoming.length) {
+    upcoming.forEach((x, i) => {
+      const fcat = category(x.avg);
+      const cell = document.createElement('div');
+      cell.className = 'glass rounded-2xl p-3 text-center';
+      const day = document.createElement('p'); day.className = 'text-[11px] text-white/45';
+      day.textContent = i === 0 && new Date(x.day + 'T00:00:00').getTime() === today.getTime()
+        ? 'Today' : new Date(x.day + 'T00:00:00').toLocaleDateString('en-IN', { weekday: 'short' });
+      const avg = document.createElement('p'); avg.className = 'text-xl font-semibold tabular-nums mt-0.5';
+      avg.textContent = x.avg; avg.style.color = fcat.ink || fcat.color;
+      const range = document.createElement('p'); range.className = 'text-[10px] text-white/35 tabular-nums';
+      range.textContent = `${x.min}–${x.max}`;
+      cell.append(day, avg, range);
+      row.appendChild(cell);
+    });
+    $('forecast').classList.remove('hidden');
+  } else $('forecast').classList.add('hidden');
+
+  // credit the data source(s) shown
+  if (isModel) {
+    $('credit').textContent = 'Open-Meteo.com air-quality model (Copernicus CAMS), CC BY 4.0';
+  } else {
+    const src = (d.attributions || []).find(a => a.name && !/waqi|world air quality/i.test(a.name));
+    $('credit').textContent = 'World Air Quality Index Project (waqi.info)' + (src ? ` and ${src.name}` : '');
+  }
+
+  $('hero').classList.remove('hidden');
+  $('pollutants').classList.remove('hidden');
+}
+
+/* ---------- AQI history chart ----------
+   One line (hourly AQI) over faint AQI-category bands.
+   Points come from /api/history: the backend fills the past 30 days from
+   the Open-Meteo model the first time a place is opened, then records the
+   live reading (station or model) every hour. */
+const SVGNS = 'http://www.w3.org/2000/svg';
+const BANDS = [0, 50, 100, 150, 200, 300, 500];
+const hist = { lat: null, lon: null, days: 7, data: null, seq: 0 };
+
+function hideHistory() { hist.lat = null; $('history').classList.add('hidden'); }
+
+async function loadHistory(lat, lon) {
+  hist.lat = lat; hist.lon = lon;
+  const seq = ++hist.seq;
+  $('history').classList.remove('hidden');
+  $('histSummary').textContent = 'Loading...';
+  try {
+    const d = await api(`history?lat=${lat}&lon=${lon}&days=${hist.days}`);
+    if (seq !== hist.seq) return;          // a newer place was opened meanwhile
+    hist.data = d;
+    drawHistory();
+  } catch (e) {
+    if (seq !== hist.seq) return;
+    hist.data = null;
+    drawHistory();
+    $('histSummary').textContent = 'History is not available right now.';
+  }
+}
+
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+const fmtHour = (t) => new Date(t * 1000).toLocaleString('en-IN', { weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric' });
+
+function drawHistory() {
+  const box = $('histChart');
+  box.querySelector('svg')?.remove();
+  const tip = $('histTip');
+  tip.style.opacity = 0;
+  const pts = (hist.data?.points || []).filter(p => Number.isFinite(p.aqi));
+  if (pts.length < 2) {
+    $('histSummary').textContent = hist.data ? 'Not enough readings yet. Check back in an hour.' : $('histSummary').textContent;
+    $('histNote').textContent = '';
+    return;
+  }
+
+  // summary: average, worst hour, share of hours above 150
+  const avg = Math.round(pts.reduce((a, p) => a + p.aqi, 0) / pts.length);
+  const worst = pts.reduce((a, p) => (p.aqi > a.aqi ? p : a));
+  const bad = Math.round(100 * pts.filter(p => p.aqi > 150).length / pts.length);
+  $('histSummary').textContent = `Average ${avg} · worst ${worst.aqi} (${new Date(worst.ts * 1000).toLocaleString('en-IN', { weekday: 'short', hour: 'numeric' })}) · ${bad}% of hours above 150`;
+  const measured = pts.filter(p => p.source === 'waqi').length;
+  $('histNote').textContent = measured
+    ? `${measured} of ${pts.length} hours measured by a nearby ground station; the rest are Open-Meteo model estimates.`
+    : 'All hours are Open-Meteo model estimates (no ground station close enough). Earlier days were filled in when this place was first opened.';
+
+  // geometry
+  const W = box.clientWidth, H = box.clientHeight;
+  const m = { l: 30, r: 6, t: 6, b: 20 };
+  const iw = W - m.l - m.r, ih = H - m.t - m.b;
+  const t1 = Math.floor(Date.now() / 1000), t0 = t1 - hist.days * 86400;
+  const top = BANDS.find(b => b >= Math.max(...pts.map(p => p.aqi)) && b >= 150) || 500;
+  const x = (t) => m.l + ((t - t0) / (t1 - t0)) * iw;
+  const y = (v) => m.t + ih - (Math.min(v, top) / top) * ih;
+
+  const svg = svgEl('svg', { width: W, height: H, viewBox: `0 0 ${W} ${H}`, role: 'img',
+    'aria-label': `Hourly AQI for the last ${hist.days} days. Average ${avg}, worst ${worst.aqi}.` });
+
+  // faint category bands, then hairline gridlines + y labels at the breakpoints
+  for (let i = 0; i < BANDS.length - 1 && BANDS[i] < top; i++) {
+    const lo = BANDS[i], hi = Math.min(BANDS[i + 1], top);
+    svgEl('rect', { x: m.l, y: y(hi), width: iw, height: y(lo) - y(hi), fill: category(lo + 1).color, 'fill-opacity': 0.07 }, svg);
+  }
+  BANDS.filter(b => b <= top).forEach(b => {
+    svgEl('line', { x1: m.l, x2: W - m.r, y1: y(b), y2: y(b), stroke: '#fff', 'stroke-opacity': b === 0 ? 0.18 : 0.07, 'stroke-width': 1, 'shape-rendering': 'crispEdges' }, svg);
+    const lbl = svgEl('text', { x: m.l - 6, y: y(b) + 3, 'text-anchor': 'end', 'font-size': 10, fill: '#fff', 'fill-opacity': 0.4 }, svg);
+    lbl.textContent = b;
+  });
+
+  // x labels at local midnights, spaced so they never collide
+  const pxPerDay = iw / hist.days;
+  const every = Math.max(1, Math.ceil(46 / pxPerDay));
+  const d = new Date(t0 * 1000); d.setHours(24, 0, 0, 0);
+  for (let i = 0; d.getTime() / 1000 < t1; i++, d.setDate(d.getDate() + 1)) {
+    if (i % every) continue;
+    const tx = x(d.getTime() / 1000);
+    if (tx < m.l + 12 || tx > W - m.r - 12) continue;
+    const lbl = svgEl('text', { x: tx, y: H - 5, 'text-anchor': 'middle', 'font-size': 10, fill: '#fff', 'fill-opacity': 0.4 }, svg);
+    lbl.textContent = hist.days <= 7
+      ? d.toLocaleDateString('en-IN', { weekday: 'short' })
+      : d.toLocaleDateString('en-IN', { day: 'numeric', month: 'short' });
+  }
+
+  // the line, broken where readings are missing for more than 2 hours
+  let path = '';
+  pts.forEach((p, i) => {
+    const gap = i === 0 || p.ts - pts[i - 1].ts > 2 * 3600;
+    path += `${gap ? 'M' : 'L'}${x(p.ts).toFixed(1)},${y(p.aqi).toFixed(1)}`;
+  });
+  svgEl('path', { d: path, fill: 'none', stroke: '#e8e8ec', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, svg);
+
+  // hover / touch: crosshair, dot, tooltip
+  const cross = svgEl('line', { y1: m.t, y2: m.t + ih, stroke: '#fff', 'stroke-opacity': 0.35, 'stroke-width': 1, visibility: 'hidden' }, svg);
+  const dot = svgEl('circle', { r: 4.5, stroke: '#0a0a0c', 'stroke-width': 2, visibility: 'hidden' }, svg);
+  const hit = svgEl('rect', { x: m.l, y: 0, width: iw, height: H, fill: 'transparent' }, svg);
+
+  const show = (ev) => {
+    const r = svg.getBoundingClientRect();
+    const t = t0 + ((ev.clientX - r.left - m.l) / iw) * (t1 - t0);
+    let lo = 0, hi = pts.length - 1;          // nearest point by time
+    while (hi - lo > 1) { const mid = (lo + hi) >> 1; (pts[mid].ts < t ? (lo = mid) : (hi = mid)); }
+    const p = Math.abs(pts[lo].ts - t) < Math.abs(pts[hi].ts - t) ? pts[lo] : pts[hi];
+    const px = x(p.ts), py = y(p.aqi), c = category(p.aqi);
+    cross.setAttribute('x1', px); cross.setAttribute('x2', px); cross.setAttribute('visibility', 'visible');
+    dot.setAttribute('cx', px); dot.setAttribute('cy', py); dot.setAttribute('fill', c.color); dot.setAttribute('visibility', 'visible');
+    tip.innerHTML = '';
+    const l1 = document.createElement('div'); l1.className = 'text-white/50'; l1.textContent = fmtHour(p.ts);
+    const l2 = document.createElement('div'); l2.className = 'text-white font-medium'; l2.textContent = `AQI ${p.aqi} · ${c.label}`;
+    const l3 = document.createElement('div'); l3.className = 'text-white/40'; l3.textContent = p.source === 'waqi' ? 'Measured (ground station)' : 'Model estimate';
+    tip.append(l1, l2, l3);
+    tip.style.opacity = 1;
+    const tw = tip.offsetWidth;
+    tip.style.left = `${Math.max(0, Math.min(W - tw, px - tw / 2))}px`;
+    tip.style.top = `${py - m.t > 60 ? 0 : ih - 44}px`;
+  };
+  const hide = () => { tip.style.opacity = 0; cross.setAttribute('visibility', 'hidden'); dot.setAttribute('visibility', 'hidden'); };
+  hit.addEventListener('pointermove', show);
+  hit.addEventListener('pointerdown', show);
+  hit.addEventListener('pointerleave', hide);
+
+  box.insertBefore(svg, tip);
+}
+
+document.querySelectorAll('.hist-tab').forEach(b => b.addEventListener('click', () => {
+  const days = Number(b.dataset.days);
+  if (days === hist.days) return;
+  hist.days = days;
+  document.querySelectorAll('.hist-tab').forEach(x => x.classList.toggle('on', x === b));
+  if (hist.lat != null) loadHistory(hist.lat, hist.lon);
+}));
+
+// redraw when the width changes (rotation, window resize)
+let histW = 0;
+new ResizeObserver(() => {
+  const w = $('histChart').clientWidth;
+  if (w && w !== histW) { histW = w; if (hist.data) drawHistory(); }
+}).observe($('histChart'));
+
+/* ---------- events ---------- */
+$('btnRefresh').addEventListener('click', () => (lastLoad || loadGPS)());
+
+document.querySelectorAll('.chip').forEach(btn => btn.addEventListener('click', () => {
+  const k = btn.dataset.chip;
+  if (k === 'gps') loadGPS();
+  else if (k === 'bhubaneswar') loadCoords(20.2961, 85.8245, 'Bhubaneswar', 'bhubaneswar');
+  else if (k === 'delhi') loadPlace('delhi', 'delhi');
+}));
+
+$('searchInput').addEventListener('input', (e) => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => doSearch(e.target.value), 450);   // debounce typing
+});
+$('searchForm').addEventListener('submit', (e) => {
+  e.preventDefault();
+  clearTimeout(searchTimer);
+  doSearch($('searchInput').value);
+});
+// close the dropdown when tapping elsewhere
+document.addEventListener('click', (e) => {
+  if (!$('searchForm').contains(e.target)) $('results').classList.add('hidden');
+});
+
+// auto refresh: on a timer, and when the app comes back to the foreground
+setInterval(() => { if (document.visibilityState === 'visible' && lastLoad) lastLoad(); }, AUTO_REFRESH_MS);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && lastLoad && Date.now() - lastFetchAt > 5 * 60 * 1000) lastLoad();
+});
+
+/* ---------- home-screen icon ----------
+   iOS needs a PNG apple-touch-icon. To keep this a single file, draw one
+   on a canvas at startup and point the <link> at it. */
+(function makeIcon() {
+  try {
+    const c = document.createElement('canvas'); c.width = c.height = 180;
+    const g = c.getContext('2d');
+    g.fillStyle = '#0a0a0c'; g.fillRect(0, 0, 180, 180);
+    const grad = g.createLinearGradient(30, 30, 150, 150);
+    grad.addColorStop(0, '#00e400'); grad.addColorStop(.5, '#ffff00'); grad.addColorStop(1, '#ff7e00');
+    g.strokeStyle = grad; g.lineWidth = 14; g.lineCap = 'round';
+    g.beginPath(); g.arc(90, 96, 56, Math.PI * 0.8, Math.PI * 2.2); g.stroke();
+    g.fillStyle = '#fff'; g.font = 'bold 44px -apple-system, Helvetica, Arial'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('AQI', 90, 100);
+    const link = document.createElement('link');
+    link.rel = 'apple-touch-icon'; link.href = c.toDataURL('image/png');
+    document.head.appendChild(link);
+  } catch {}
+})();
+
+/* ---------- start ---------- */
+// true when opened from the iPhone home screen (fullscreen web app)
+function isStandalone() {
+  return window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+}
+
+// Has the user already allowed location? ('granted' | 'prompt' | 'denied' | 'unknown')
+async function locationPermission() {
+  try {
+    const p = await navigator.permissions.query({ name: 'geolocation' });
+    return p.state;
+  } catch { return 'unknown'; }
+}
+
+function loadSavedPlace() {
+  let last = null;
+  try { last = JSON.parse(store.get(STORE_LAST) || 'null'); } catch {}
+  if (last?.type === 'uid') return loadStation(last.uid, last.chip);
+  if (last?.type === 'place') return loadPlace(last.keyword, last.chip);
+  if (last?.type === 'coords') return loadCoords(last.lat, last.lon, last.label, last.chip);
+  return loadCoords(20.2961, 85.8245, 'Bhubaneswar', 'bhubaneswar');
+}
+
+async function start() {
+
+  // Home-screen app on iPhone: iOS often refuses a location request made
+  // automatically on open, without showing the Allow popup. So only ask
+  // when the user taps Current GPS, unless permission is already granted.
+  if (isStandalone() && (await locationPermission()) !== 'granted') {
+    // icon was added with a saved spot: show it straight away, live GPS still on tap
+    if (savedHome()) {
+      setActiveChip('gps');
+      lastLoad = loadGPS;
+      await run(async () => { await showFallback(); });
+      return;
+    }
+    let last = null;
+    try { last = JSON.parse(store.get(STORE_LAST) || 'null'); } catch {}
+    if (last?.type === 'gps') last = null;      // can't auto-run GPS here
+    await (last ? loadSavedPlace() : loadCoords(20.2961, 85.8245, 'Bhubaneswar', 'bhubaneswar'));
+    if ($('notice').classList.contains('hidden')) notice('Tap Current GPS to use your location. iPhone will ask once for this home-screen app.', 'warn');
+    return;
+  }
+
+  // try GPS first; if that fails, fall back to the last place viewed, then Bhubaneswar
+  loadGPS().then(async () => {
+    if (!$('hero').classList.contains('hidden')) return;
+    const why = $('notice').textContent;
+    await loadSavedPlace();
+    // keep the GPS reason visible unless the fallback raised its own message
+    if (why && $('notice').classList.contains('hidden')) notice(`${why} Showing a saved place instead.`, 'warn');
+  });
+}
+start();
+</script>
+</body>
+</html>

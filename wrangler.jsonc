@@ -1,0 +1,24 @@
+{
+  // Cloudflare Worker config. Same name as the existing app, so it keeps
+  // the URL samarth-aqi.samarth0205.workers.dev
+  "name": "samarth-aqi",
+  "main": "src/worker.js",
+  "compatibility_date": "2025-09-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  // hourly AQI history (schema in schema.sql)
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "aqi-history",
+      "database_id": "75cbf02e-39c1-4eed-97a3-adaf1e175189"
+    }
+  ],
+  // record readings at 7 minutes past every hour
+  "triggers": { "crons": ["7 * * * *"] },
+  "observability": { "enabled": true },
+  // no per-version preview links; only the main URL is served
+  "preview_urls": false
+}

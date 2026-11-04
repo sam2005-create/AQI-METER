@@ -1,0 +1,20 @@
+{
+  "name": "samarth-aqi",
+  "version": "1.0.0",
+  "description": "Live AQI web app with a Cloudflare Worker backend",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "npm run css && wrangler dev",
+    "deploy": "npm run css && wrangler deploy",
+    "css": "tailwindcss -c tailwind.config.cjs -i src/tailwind.css -o public/app.css --minify"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "devDependencies": {
+    "tailwindcss": "^3.4.16",
+    "wrangler": "^4.157.0"
+  }
+}
