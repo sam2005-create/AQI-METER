@@ -8,8 +8,13 @@ CREATE TABLE IF NOT EXISTS places (
   lon         REAL NOT NULL,
   first_seen  INTEGER NOT NULL,          -- unix seconds
   last_seen   INTEGER NOT NULL,          -- last time the app asked for it
-  backfilled  INTEGER NOT NULL DEFAULT 0 -- 1 once the past 30 days were filled in
+  backfilled  INTEGER NOT NULL DEFAULT 0, -- 1 once the past 30 days were filled in
+  station_uid INTEGER,                   -- nearest WAQI station (-1 = none found, NULL = not looked up yet)
+  station_km  REAL
 );
+-- Databases created before station_uid existed:
+--   ALTER TABLE places ADD COLUMN station_uid INTEGER;
+--   ALTER TABLE places ADD COLUMN station_km REAL;
 
 -- One row per place per hour.
 -- source: 'waqi' = measured by a ground station, 'model' = Open-Meteo estimate

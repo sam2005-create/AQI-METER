@@ -8,9 +8,13 @@
  *   picked by the same rule as the app) for each tracked place.
  */
 
-import { bestForPoint } from './sources.js';
+import { RULE, bestForPoint, stationFeed, hoursOld } from './sources.js';
 
-const MAX_PLACES = 4;       // keeps the hourly job inside the free plan's request limits
+// The hourly job remembers each place's nearest station, so recording a place
+// costs at most 2 upstream requests. 12 places stays well inside the free
+// plan's 50 subrequests per run.
+const MAX_PLACES = 12;
+const FULL_LOOKUPS_PER_RUN = 2;  // places whose nearest station isn't known yet
 const KEEP_DAYS = 35;       // readings older than this are deleted
 const IDLE_DAYS = 30;       // places the app hasn't asked about in this long stop being tracked
 const BACKFILL_DAYS = 30;
@@ -70,17 +74,39 @@ async function backfill(env, place) {
   await env.DB.prepare('UPDATE places SET backfilled = 1 WHERE id = ?1').bind(place.id).run();
 }
 
-// Store the current reading for this hour, from the same rule the app uses
-async function recordNow(env, place) {
-  const r = await bestForPoint(env, place.lat, place.lon);
-  const feed = r.chosen === 'waqi' ? r.station : r.model;
+// Store this hour's reading for a place (replaces the backfilled model value)
+async function saveReading(env, id, source, feed) {
   const aqi = Number(feed?.aqi);
   if (!Number.isFinite(aqi)) return;
   const pm25 = Number(feed.iaqi?.pm25?.v);
   await env.DB.prepare(
     `INSERT INTO readings (place_id, ts, aqi, pm25, source) VALUES (?1, ?2, ?3, ?4, ?5)
      ON CONFLICT(place_id, ts) DO UPDATE SET aqi = excluded.aqi, pm25 = excluded.pm25, source = excluded.source`,
-  ).bind(place.id, hourOf(nowS()), Math.round(aqi), Number.isFinite(pm25) ? Math.round(pm25) : null, r.chosen).run();
+  ).bind(id, hourOf(nowS()), Math.round(aqi), Number.isFinite(pm25) ? Math.round(pm25) : null, source).run();
+}
+
+// Full source rule (same as the app). Also remembers the nearest station
+// for the cheap hourly path. station_uid -1 means "looked, none found".
+async function recordFull(env, place) {
+  const r = await bestForPoint(env, place.lat, place.lon);
+  await env.DB.prepare('UPDATE places SET station_uid = ?2, station_km = ?3 WHERE id = ?1')
+    .bind(place.id, r.nearest?.uid ?? -1, r.nearest?.km ?? null).run();
+  await saveReading(env, place.id, r.chosen, r.chosen === 'waqi' ? r.station : r.model);
+}
+
+// Cheap version for the cron: the remembered station if it's close and fresh,
+// else the Open-Meteo current value. Same rule, fewer requests.
+async function recordFast(env, place) {
+  if (place.station_uid > 0 && place.station_km <= RULE.maxKm) {
+    try {
+      const st = await stationFeed(env, place.station_uid);
+      if (hoursOld(st) <= RULE.maxAgeH) return saveReading(env, place.id, 'waqi', st);
+    } catch { /* fall through to the model */ }
+  }
+  const res = await fetch(`https://air-quality-api.open-meteo.com/v1/air-quality?latitude=${place.lat}&longitude=${place.lon}&current=us_aqi,us_aqi_pm2_5`);
+  if (!res.ok) throw new Error(`Open-Meteo ${res.status}`);
+  const cur = (await res.json()).current;
+  return saveReading(env, place.id, 'model', { aqi: cur?.us_aqi, iaqi: { pm25: { v: cur?.us_aqi_pm2_5 } } });
 }
 
 /* ---------- API + cron ---------- */
@@ -95,7 +121,7 @@ export async function historyFor(env, lat, lon, days) {
   const thisHour = await env.DB.prepare(
     `SELECT 1 FROM readings WHERE place_id = ?1 AND ts = ?2 AND source != 'model' LIMIT 1`,
   ).bind(place.id, hourOf(nowS())).first();
-  if (!thisHour) { try { await recordNow(env, place); } catch { /* the chart still has the backfill */ } }
+  if (!thisHour) { try { await recordFull(env, place); } catch { /* the chart still has the backfill */ } }
 
   const rows = await env.DB.prepare(
     'SELECT ts, aqi, pm25, source FROM readings WHERE place_id = ?1 AND ts >= ?2 ORDER BY ts',
@@ -111,7 +137,11 @@ export async function hourlyJob(env) {
   for (const r of idle.results) await dropPlace(env, r.id);
 
   const places = await env.DB.prepare('SELECT * FROM places ORDER BY last_seen DESC LIMIT ?1').bind(MAX_PLACES).all();
+  let full = 0;
   for (const p of places.results) {
-    try { await recordNow(env, p); } catch (e) { console.log(`history: ${p.id} failed: ${e.message}`); }
+    try {
+      if (p.station_uid == null && full < FULL_LOOKUPS_PER_RUN) { full++; await recordFull(env, p); }
+      else await recordFast(env, p);
+    } catch (e) { console.log(`history: ${p.id} failed: ${e.message}`); }
   }
 }

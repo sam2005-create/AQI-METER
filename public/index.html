@@ -444,7 +444,7 @@ async function loadStation(uid, chip = null) {
   lastLoad = () => loadStation(uid, chip);
   await run(async () => {
     const data = await api(`station?uid=${encodeURIComponent(uid)}`);
-    hideHistory();
+    historyForFeed(data);
     render(data, 'Selected station', { kind: 'waqi', reason: 'Measured by the WAQI station you picked.' });
     store.set(STORE_LAST, JSON.stringify({ type: 'uid', uid, chip }));
   });
@@ -456,7 +456,9 @@ async function loadPlace(keyword, chip) {
   lastLoad = () => loadPlace(keyword, chip);
   await run(async () => {
     const data = await api(`place?q=${encodeURIComponent(keyword)}`);
-    hideHistory();
+    // city chips use a fixed point, so the "best station" changing doesn't start a new history
+    const fixed = CITY_POINTS[keyword];
+    fixed ? loadHistory(fixed[0], fixed[1]) : historyForFeed(data);
     render(data, `Best live station for ${keyword}`, { kind: 'waqi', reason: 'Measured by the most recently reporting WAQI station for this city.' });
     store.set(STORE_LAST, JSON.stringify({ type: 'place', keyword, chip }));
   });
@@ -660,7 +662,16 @@ const SVGNS = 'http://www.w3.org/2000/svg';
 const BANDS = [0, 50, 100, 150, 200, 300, 500];
 const hist = { lat: null, lon: null, days: 7, data: null, seq: 0 };
 
+const CITY_POINTS = { delhi: [28.63, 77.22] };
+
 function hideHistory() { hist.lat = null; $('history').classList.add('hidden'); }
+
+// history for a station's own location (rounded to ~1 km like GPS)
+function historyForFeed(feed) {
+  const [lat, lon] = (feed?.city?.geo || []).map(Number);
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return hideHistory();
+  loadHistory(Math.round(lat * 100) / 100, Math.round(lon * 100) / 100);
+}
 
 async function loadHistory(lat, lon) {
   hist.lat = lat; hist.lon = lon;

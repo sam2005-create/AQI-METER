@@ -67,7 +67,8 @@ Only GET is allowed. Coordinates and text inputs are validated before anything i
 
 - The first time a place is opened, the backend fills in the past 30 days from Open-Meteo's hourly data, so the chart is useful straight away.
 - After that, the cron job stores one reading per hour from whichever source the rule picks.
-- It tracks the 4 most recently opened places. That keeps the hourly job within the Workers free plan's subrequest limit. Readings older than 35 days are deleted.
+- Any place you open gets a history: your GPS spot, a city chip, or a station you searched for (Singapore, Tokyo and so on).
+- It tracks the 12 most recently opened places. Each place remembers its nearest station, so the hourly job needs at most 2 upstream requests per place and stays within the Workers free plan's limit of 50. Readings older than 35 days are deleted.
 
 The schema is in `schema.sql`: a `places` table and a `readings` table keyed by place and hour.
 
